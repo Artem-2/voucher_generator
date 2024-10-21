@@ -1,122 +1,186 @@
-from PyPDF2 import PdfReader, PdfWriter
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
-from reportlab.lib import colors
-from reportlab.graphics.barcode import qr, code128
-from reportlab.graphics.shapes import Drawing
-from reportlab.graphics import renderPDF # Import renderPDF
-from PIL import Image, ImageOps
-from io import BytesIO
 import os
-    
+from PyPDF2 import PdfReader, PdfWriter
+from PIL import Image, ImageDraw, ImageFont
+import qrcode
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.utils import simpleSplit
+import barcode
+from barcode import get_barcode_class
+from barcode.writer import ImageWriter
+from io import BytesIO
+import tempfile
 
 class PDFModifier:
-    def __init__(self, input_pdf_path):
-        self.input_pdf_path = input_pdf_path
-        self.output_pdf_path = "modified_output.pdf"
-    
-    def add_elements_to_pdf(self, text_data, qr_data, barcode_data, font_paths, positions):
-        # Read the existing PDF
-        reader = PdfReader(self.input_pdf_path)
+    def __init__(self, pdf_path):
+        self.pdf_path = pdf_path
+        self.coordinates = []
+
+    def add_elements(self, barcode_text, qr_text, texts):
+        reader = PdfReader(self.pdf_path)
         writer = PdfWriter()
         
-        # Create a temporary PDF with reportlab
-        buffer = BytesIO()
-        packet = canvas.Canvas(buffer, pagesize=A4)
-        
-        # Add Texts
-        for i, (text, font_path, position, font_size) in enumerate(zip(text_data, font_paths, positions["text"], positions["text_size"])):
-            packet.setFont(self._add_font_to_canvas(packet, font_path, f"CustomFont{i}"), font_size)
-            packet.drawString(position[0], position[1], text)
-        
-        # Add QR Code
-        for qr_string, position, size in zip(qr_data, positions["qr"], positions["qr_size"]):
-            qr_code = qr.QrCodeWidget(qr_string)
-            bounds = qr_code.getBounds()
-            w = bounds[2] - bounds[0]
-            h = bounds[3] - bounds[1]
-            barcode_image = self._barcode_to_image(qr_code, w, h, size)
-            img = ImageReader(barcode_image)
-            packet.drawImage(img, position[0], position[1], mask='auto')
+        for page_number in range(len(reader.pages)):
+            packet = BytesIO()
+            
+            can = canvas.Canvas(packet, pagesize=letter)
+            page_data = reader.pages[page_number]
+            can.setPageSize((page_data.mediabox.width, page_data.mediabox.height))
+            
+            # Добавляем штрих-код
+            barcode_img = self.create_barcode(barcode_text)
+            self.place_image_on_pdf(can, barcode_img, 50, 100)
 
-        # Add Barcode
-        for barcode_string, position, size in zip(barcode_data, positions["barcode"], positions["barcode_size"]):
-            barcode = code128.Code128(barcode_string)
-            bounds = barcode.getBounds()
-            w = bounds[2] - bounds[0]
-            h = bounds[3] - bounds[1]
-            barcode_image = self._barcode_to_image(barcode, w, h, size)
-            img = ImageReader(barcode_image)
-            packet.drawImage(img, position[0], position[1], mask='auto')
+            # Добавляем QR-код
+            qr_img = self.create_qr_code(qr_text)
+            self.place_image_on_pdf(can, qr_img, 50, 500)
 
-        packet.save()
-        
-        # Merge temporary PDF with original
-        buffer.seek(0)
-        new_pdf = PdfReader(buffer)
-        
-        for page in reader.pages:
+            # Добавляем текст
+            self.add_text(can, texts)
+
+            can.save()
+
+            packet.seek(0)
+            new_pdf = PdfReader(packet)
+            page = reader.pages[page_number]
+            page.merge_page(new_pdf.pages[0])
+
             writer.add_page(page)
+
+        with open("output.pdf", "wb") as file:
+            writer.write(file)
         
-        for page in new_pdf.pages:
-            writer.pages[0].merge_page(page)
-        
-        # Write the final output PDF
-        with open(self.output_pdf_path, 'wb') as out_pdf:
-            writer.write(out_pdf)
+        return self.coordinates
 
-    def _add_font_to_canvas(self, packet, font_path, font_name):
-        from reportlab.pdfbase.ttfonts import TTFont
-        from reportlab.pdfbase import pdfmetrics
-        pdfmetrics.registerFont(TTFont(font_name, font_path))
-        return font_name
+    def create_barcode(self, text):
+        barcode_cls = get_barcode_class('code128')
+        barcode_data = barcode_cls(text, writer=ImageWriter())
 
-    def _barcode_to_image(self, barcode, w, h, size):
-        ''' Create barcode image without white borders '''
-        barcode_image_buffer = BytesIO()
-        barcode_draw = Drawing(size[0], size[1])
-        barcode_black = barcode
-        barcode_black.barFillColor = colors.black
-        barcode_black.barStrokeColor = colors.black
-        barcode_draw.add(barcode_black)
+        img_fp = BytesIO()
+        barcode_data.write(img_fp, options={"write_text": False})
+        img_fp.seek(0)
 
-        # Render to the buffer
-        renderPDF.drawToFile(barcode_draw, barcode_image_buffer)
+        img = Image.open(img_fp)
 
-        # Set buffer position to start
-        barcode_image_buffer.seek(0)
+        # Переводим изображение в градации серого
+        gray_img = img.convert('L')
 
-        # Attempt to convert directly to an image if format permits
-        try:
-            barcode_image = Image.open(barcode_image_buffer)
-            barcode_image = ImageOps.invert(barcode_image.convert('L'))
-            barcode_image = barcode_image.convert("RGBA")
-        except Exception as e:
-            print(f"Error opening image from buffer: {e}")
-            # Optionally save for debugging
-            with open('debug_image_output.pdf', 'wb') as f:
-                f.write(barcode_image_buffer.getvalue())
-            raise
+        # Получаем данные пикселей
+        pixel_data = gray_img.load()
 
-        barcode_image_buffer.close()
-        return barcode_image
+        # Избавляемся от белой обводки путем поиска границ штрих-кода
+        width, height = gray_img.size
 
+        def find_borders(pixel_data, width, height):
+                top, bottom, left, right = None, None, None, None
+
+                # Найти верхнюю границу
+                for y in range(height):
+                        for x in range(width):
+                                if pixel_data[x, y] < 255: # не белый пиксель
+                                        top = y
+                                        break
+                        if top is not None:
+                                break
+
+                # Найти нижнюю границу
+                for y in range(height - 1, -1, -1):
+                        for x in range(width):
+                                if pixel_data[x, y] < 255: # не белый пиксель
+                                        bottom = y
+                                        break
+                        if bottom is not None:
+                                break
+
+                # Найти левую границу
+                for x in range(width):
+                        for y in range(height):
+                                if pixel_data[x, y] < 255: # не белый пиксель
+                                        left = x
+                                        break
+                        if left is not None:
+                                break
+
+                # Найти правую границу
+                for x in range(width - 1, -1, -1):
+                        for y in range(height):
+                                if pixel_data[x, y] < 255: # не белый пиксель
+                                        right = x
+                                        break
+                        if right is not None:
+                                break
+
+                return left, top, right, bottom
+
+        left, top, right, bottom = find_borders(pixel_data, width, height)
+
+        # Обрезаем изображение до контента
+        img = img.crop((left, top, right + 1, bottom + 1))
+
+        return img
+
+
+
+    def create_qr_code(self, data):
+        qr = qrcode.QRCode(border=0)
+        qr.add_data(data)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGBA")
+
+        datas = qr_img.getdata()
+        new_data = []
+        for item in datas:
+            if item[0] > 200 and item[1] > 200 and item[2] > 200:
+                new_data.append((255, 255, 255, 0)) # прозрачный
+            else:
+                new_data.append(item)
+        qr_img.putdata(new_data)
+
+        return qr_img
+
+    def place_image_on_pdf(self, canvas, img, x, y):
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
+                img.save(tmp_file, format='PNG')
+                tmp_file_path = tmp_file.name
+
+        # Получить размеры изображения
+        img_width, img_height = img.size
+
+        # Нарисовать изображение на PDF
+        canvas.drawImage(tmp_file_path, x, y, width=img_width, height=img_height)
+
+        # Теперь добавляем рамку вокруг изображения
+        canvas.setStrokeColorRGB(1, 0, 0) # Пример: красная рамка
+        # Использовать img_width и img_height для точного соответствия обводке
+        canvas.rect(x, y, img_width, img_height, stroke=1)
+
+        self.coordinates.append((x, y, img_width, img_height))
+        os.unlink(tmp_file_path)
+
+    def add_text(self, canvas, texts):
+        x, y = 300, 700
+        fonts = ["arial.ttf", "times.ttf"] # Путевые пути для шрифтов
+
+        for i, (text, font_path) in enumerate(zip(texts, fonts)):
+            pdfmetrics.registerFont(TTFont(font_path.split('.ttf')[0], font_path))
+            canvas.setFont(font_path.split('.ttf')[0], 14)
+
+            text_lines = simpleSplit(text, canvas._fontname, canvas._fontsize, canvas._pagesize[0])
+            max_text_width = max(canvas.stringWidth(line, font_path.split('.ttf')[0], 14) for line in text_lines)
+            text_height = 14 * len(text_lines)
+
+            text_y = y - i * 50 + 20 # Сдвигаем текст вверх на 20 единиц
+            canvas.drawString(x, text_y, text)
+
+            # Добавляем рамку вокруг текста
+            canvas.setStrokeColorRGB(0, 1, 0) # Пример: зеленая рамка
+            canvas.rect(x, text_y - text_height, max_text_width, text_height, stroke=1)
+
+            self.coordinates.append((x, text_y - text_height, max_text_width, text_height))
 
 # Пример использования
-
-text_data = ["Пример текста 1", "Пример текста 2"]
-qr_data = ["https://example.com/qrcode1", "https://example.com/qrcode2"]
-barcode_data = ["123456789012", "987654321098"]
-font_paths = ["arial.ttf", "tahoma.ttf"]
-positions = {
-    "text": [(100, 200), (100, 300)],
-    "qr": [(200, 400), (200, 500)],
-    "barcode": [(300, 600), (300, 700)],
-    "text_size": [12, 14],
-    "qr_size": [(100, 100), (120, 120)],
-    "barcode_size": [(150, 50), (150, 50)],
-}
-
-modifier = PDFModifier("original.pdf")
-modifier.add_elements_to_pdf(text_data, qr_data, barcode_data, font_paths, positions)
+pdf_modifier = PDFModifier('input_pdf\\input.pdf')
+elements_coordinates = pdf_modifier.add_elements("barcode1231231213", "This is a QR Code", ["First text", "Second text"])
+print("Elements coordinates:", elements_coordinates)
